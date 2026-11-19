@@ -1,0 +1,2 @@
+# One module per line, named as in nginx/pkg-oss (rpm/SPECS/Makefile.module-<name>).
+geoip2

@@ -1,0 +1,113 @@
+---
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+defaults:
+  run:
+    shell: bash -Eeuo pipefail {0}
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.setup.outputs.ref }}
+      modules: ${{ steps.setup.outputs.modules }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - id: setup
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          ref=$(tr -d '[:space:]' < PKG_OSS_REF)
+          if [[ "$REF_TYPE" == tag && "$REF_NAME" != "$ref" ]]; then
+            echo "::error::tag '$REF_NAME' does not match PKG_OSS_REF '$ref'"
+            exit 1
+          fi
+          modules=$(grep -v -e '^#' -e '^[[:space:]]*$' MODULES | jq -Rnc '[inputs]')
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "modules=$modules" >> "$GITHUB_OUTPUT"
+          echo "pkg-oss $ref, modules: $modules"
+
+  build:
+    needs: setup
+    name: ${{ matrix.module }} ${{ matrix.image }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.setup.outputs.modules) }}
+        image:
+          - almalinux:9
+          - almalinux:10
+          - debian:bookworm
+          - debian:trixie
+          - ubuntu:jammy
+          - ubuntu:noble
+        arch: [amd64, arm64]
+    env:
+      REF: ${{ needs.setup.outputs.ref }}
+      MODULE: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: build
+        run: bash ci/build.sh "$REF" "$MODULE" dist
+
+      - name: test
+        run: bash ci/test.sh "$REF" "$MODULE" dist
+
+      - id: artifact
+        env:
+          IMAGE: ${{ matrix.image }}
+          ARCH: ${{ matrix.arch }}
+        run: echo "name=${MODULE}-${IMAGE/:/-}-${ARCH}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [setup, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3.0.4
+        with:
+          name: nginx ${{ needs.setup.outputs.ref }}
+          body: |
+            Dynamic modules for the official nginx.org nginx ${{ needs.setup.outputs.ref }} packages,
+            built with [nginx/pkg-oss@${{ needs.setup.outputs.ref }}](https://github.com/nginx/pkg-oss/tree/${{ needs.setup.outputs.ref }}).
+            Modules: ${{ join(fromJson(needs.setup.outputs.modules), ', ') }}
+          files: dist/*
+          fail_on_unmatched_files: true
